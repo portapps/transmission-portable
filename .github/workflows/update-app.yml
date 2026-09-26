@@ -1,0 +1,149 @@
+name: update-app
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'
+  push:
+    branches:
+      - 'master'
+  pull_request:
+    paths:
+      - '.github/workflows/update-app.yml'
+      - 'build.properties'
+
+jobs:
+  update:
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    environment: update-app # secrets are gated by this environment
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      -
+        name: GitHub auth token from GitHub App
+        id: write-app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PORTAPPS_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.PORTAPPS_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.write-app.outputs.token }}
+          fetch-depth: 0
+          persist-credentials: false
+      -
+        name: Update Transmission
+        id: update
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: &update-script |
+            const fs = require('fs');
+            const path = require('path');
+
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner: 'transmission',
+              repo: 'transmission',
+              per_page: 100
+            });
+            const candidates = releases.filter(release => {
+              if (release.draft || release.prerelease || !/^\d+(?:\.\d+){1,2}$/.test(release.tag_name)) {
+                return false;
+              }
+              const installer = `transmission-${release.tag_name}-x64.msi`;
+              return release.assets.some(asset => asset.name === installer);
+            });
+            if (candidates.length === 0) {
+              throw new Error('No stable Transmission x64 MSI found in upstream releases');
+            }
+            candidates.sort((left, right) => {
+              const leftParts = left.tag_name.split('.').map(Number);
+              const rightParts = right.tag_name.split('.').map(Number);
+              for (let i = 0; i < Math.max(leftParts.length, rightParts.length); i++) {
+                const difference = (leftParts[i] || 0) - (rightParts[i] || 0);
+                if (difference !== 0) {
+                  return difference;
+                }
+              }
+              return 0;
+            });
+            const latest = candidates.at(-1);
+            const file = path.join(process.env.GITHUB_WORKSPACE, 'build.properties');
+            const current = fs.readFileSync(file, 'utf8');
+            const versionMatch = current.match(/^app\.version\s*=\s*(.+)$/m);
+            const releaseMatch = current.match(/^app\.release\s*=\s*(\d+)$/m);
+            if (!versionMatch || !releaseMatch) {
+              throw new Error('Missing app.version or app.release in build.properties');
+            }
+
+            const version = latest.tag_name;
+            const versionChanged = version !== versionMatch[1].trim();
+            const nextRelease = Number(releaseMatch[1]) + (versionChanged ? 1 : 0);
+            let updated = current.replace(/^app\.version\s*=\s*.+$/m, `app.version = ${version}`);
+            updated = updated.replace(/^app\.release\s*=\s*\d+$/m, `app.release = ${nextRelease}`);
+            if (updated !== current) {
+              fs.writeFileSync(file, updated, 'utf8');
+              core.info(`Updated build.properties to Transmission ${version}`);
+            } else {
+              core.info('build.properties is already up to date');
+            }
+            core.setOutput('version', version);
+            core.setOutput('title', `Transmission ${version}`);
+      -
+        name: Create pull request
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          base: ${{ github.event.repository.default_branch }}
+          branch: update-transmission
+          token: ${{ steps.write-app.outputs.token }}
+          commit-message: ${{ steps.update.outputs.title }}
+          title: ${{ steps.update.outputs.title }}
+          signoff: true
+          sign-commits: true
+          delete-branch: true
+          body: |
+            This updates Transmission to ${{ steps.update.outputs.version }}.
+
+  diff:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      -
+        name: Update Transmission
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: *update-script
+      -
+        name: Show diff
+        shell: pwsh
+        run: |
+          $diff = git --no-pager diff -- build.properties
+          if ($diff) {
+            $diff
+          } else {
+            Write-Host "No update diff."
+          }
